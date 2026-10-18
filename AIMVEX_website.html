@@ -110,6 +110,10 @@
     .camera-placeholder strong { color: var(--text); }
     .camera-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
     .camera-controls .btn { padding: 9px 14px; font-size: .88rem; }
+    .camera-select {
+      max-width: 100%; border: 1px solid var(--border); border-radius: 10px;
+      padding: 8px 10px; background: var(--surface); color: var(--text);
+    }
     .camera-status { flex: 1 1 100%; min-height: 1.5em; margin: 0; color: var(--muted); font-size: .82rem; }
     .privacy-note { margin: 9px 0 0; color: var(--muted); font-size: .76rem; }
     section { padding: 76px 0; }
@@ -254,6 +258,9 @@
           <div class="camera-controls">
             <button class="btn btn-primary" id="startCamera" type="button">Start Live Detection</button>
             <button class="btn btn-secondary" id="stopCamera" type="button" hidden>Stop Camera</button>
+            <label id="cameraPickerLabel" for="cameraPicker" hidden>Camera
+              <select class="camera-select" id="cameraPicker" aria-label="Choose camera"></select>
+            </label>
             <p class="camera-status" id="cameraStatus" role="status" aria-live="polite">Camera is off.</p>
           </div>
           <p class="privacy-note">Camera access requires your permission. Video is processed on this device and is not recorded or uploaded.</p>
@@ -596,6 +603,8 @@
     const placeholder = document.getElementById("cameraPlaceholder");
     const startButton = document.getElementById("startCamera");
     const stopButton = document.getElementById("stopCamera");
+    const cameraPickerLabel = document.getElementById("cameraPickerLabel");
+    const cameraPicker = document.getElementById("cameraPicker");
     const status = document.getElementById("cameraStatus");
     const visionLabel = document.getElementById("visionLabel");
     const visionFps = document.getElementById("visionFps");
@@ -607,7 +616,9 @@
     let animationFrame;
     let lastInference = 0;
     let starting = false;
+    let switchingCamera = false;
     let sessionId = 0;
+    let activeCameraLabel = "the selected camera";
 
     function stopCamera(message) {
       sessionId++;
@@ -621,6 +632,8 @@
       canvas.hidden = true;
       placeholder.hidden = false;
       stopButton.hidden = true;
+      cameraPickerLabel.hidden = true;
+      cameraPicker.replaceChildren();
       startButton.hidden = false;
       startButton.disabled = false;
       startButton.textContent = "Start Live Detection";
@@ -660,6 +673,80 @@
       }
       detector = await detectorPromise;
       return detector;
+    }
+
+    async function selectPreferredCamera(cameraStream, currentSession) {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      if (currentSession !== sessionId) return cameraStream;
+      const cameras = devices.filter(function (device) { return device.kind === "videoinput"; });
+      const activeDeviceId = cameraStream.getVideoTracks()[0].getSettings().deviceId;
+      const physicalCamera = cameras.find(function (device) {
+        return /integrated|built.?in|internal|laptop|facetime|hd camera|webcam/i.test(device.label)
+          && !/virtual|iriun|irium|obs|droidcam/i.test(device.label);
+      });
+      cameraPicker.replaceChildren();
+      cameras.forEach(function (device, index) {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+        option.textContent = device.label || "Camera " + (index + 1);
+        cameraPicker.append(option);
+      });
+      cameraPicker.value = physicalCamera ? physicalCamera.deviceId : activeDeviceId;
+      activeCameraLabel = cameraPicker.selectedOptions[0]?.textContent || "the selected camera";
+      cameraPickerLabel.hidden = cameras.length < 2;
+      if (!physicalCamera || physicalCamera.deviceId === activeDeviceId) return cameraStream;
+      try {
+        const preferredStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { deviceId: { exact: physicalCamera.deviceId }, width: { ideal: 640 }, height: { ideal: 480 } },
+        });
+        if (currentSession !== sessionId) {
+          preferredStream.getTracks().forEach(function (track) { track.stop(); });
+          return cameraStream;
+        }
+        cameraStream.getTracks().forEach(function (track) { track.stop(); });
+        cameraPicker.value = physicalCamera.deviceId;
+        activeCameraLabel = physicalCamera.label;
+        status.textContent = "Using " + physicalCamera.label + ". Loading the on-device detector...";
+        return preferredStream;
+      } catch (error) {
+        console.warn("Could not switch to the preferred built-in camera.", error);
+        cameraPicker.value = activeDeviceId;
+        status.textContent = "Could not switch to " + physicalCamera.label + "; using the default camera instead.";
+        return cameraStream;
+      }
+    }
+
+    async function switchCamera(deviceId) {
+      if (!deviceId || !stream || switchingCamera) return;
+      switchingCamera = true;
+      cameraPicker.disabled = true;
+      status.textContent = "Switching camera...";
+      const currentSession = sessionId;
+      try {
+        const nextStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } },
+        });
+        if (currentSession !== sessionId) {
+          nextStream.getTracks().forEach(function (track) { track.stop(); });
+          return;
+        }
+        const previousStream = stream;
+        stream = nextStream;
+        video.srcObject = nextStream;
+        await video.play();
+        previousStream.getTracks().forEach(function (track) { track.stop(); });
+        activeCameraLabel = cameraPicker.selectedOptions[0]?.textContent || "the selected camera";
+        status.textContent = "Live detection is running on " + activeCameraLabel + ". Video stays on your device.";
+      } catch (error) {
+        console.error("Could not switch cameras.", error);
+        status.textContent = "Could not open the selected camera. The previous camera is still active.";
+        cameraPicker.value = stream.getVideoTracks()[0].getSettings().deviceId;
+      } finally {
+        switchingCamera = false;
+        cameraPicker.disabled = false;
+      }
     }
 
     function drawDetections(result) {
@@ -726,9 +813,9 @@
       startButton.textContent = "Starting...";
       status.textContent = "Requesting camera permission...";
       try {
-        const cameraStream = await navigator.mediaDevices.getUserMedia({
+        let cameraStream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
+          video: { width: { ideal: 640 }, height: { ideal: 480 } },
         });
         if (currentSession !== sessionId) {
           cameraStream.getTracks().forEach(function (track) { track.stop(); });
@@ -738,6 +825,15 @@
         video.srcObject = stream;
         await video.play();
         if (currentSession !== sessionId) return;
+        status.textContent = "Checking available cameras...";
+        cameraStream = await selectPreferredCamera(cameraStream, currentSession);
+        if (currentSession !== sessionId) {
+          cameraStream.getTracks().forEach(function (track) { track.stop(); });
+          return;
+        }
+        stream = cameraStream;
+        video.srcObject = stream;
+        await video.play();
         status.textContent = "Loading the on-device object detector...";
         await loadDetector();
         if (currentSession !== sessionId) return;
@@ -747,7 +843,7 @@
         startButton.hidden = true;
         stopButton.hidden = false;
         starting = false;
-        status.textContent = "Live detection is running. Video stays on your device.";
+        status.textContent = "Live detection is running on " + activeCameraLabel + ". Video stays on your device.";
         animationFrame = requestAnimationFrame(detectFrame);
       } catch (error) {
         console.error("Could not start the live vision demo.", error);
@@ -769,6 +865,7 @@
     });
 
     stopButton.addEventListener("click", function () { stopCamera(); });
+    cameraPicker.addEventListener("change", function () { switchCamera(cameraPicker.value); });
     document.addEventListener("visibilitychange", function () {
       if (document.hidden && stream) stopCamera("Camera paused while this tab is hidden.");
     });
